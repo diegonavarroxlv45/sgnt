@@ -1439,7 +1439,7 @@ def borrow(amount: float):
 
     # 📥 LEVERAGE BORROW RESP
     resp = send_signed_request("POST", "/sapi/v1/margin/loan", params)
-    err = check_error(resp, symbol, "Leverage Borrow")
+    err = check_error(resp, "USDC", "Leverage Borrow")
     if err:
         return err
 
@@ -1480,7 +1480,7 @@ def repay(amount):
 
     # 💳 LEVERAGE REPAY RESP
     resp = send_signed_request("POST", "/sapi/v1/margin/repay", params)
-    err = check_error(resp, symbol, "Leverage Repay")
+    err = check_error(resp, "USDC", "Leverage Repay")
     if err:
         return err
 
@@ -2432,11 +2432,11 @@ def dashboard():
             try {
                 const r = await fetch(url);
                 if (r.status === 403) {
-                    toast('Session expired', false); return null; }
+                    toast('Session expired', false);
                     setTimeout(() => window.location.href = '/login', 1500);
                     return null;
-                 }
-                 return await r.json();
+                }
+                return await r.json();
             } catch(e) { toast('Network error', false); return null; }
         }
 
