@@ -46,6 +46,7 @@ DFT_TESTNET = False
 DFT_SL_OVERRIDE = True
 DFT_TP_OVERRIDE = True
 DFT_LOG_DEBUG = False
+DFT_ALGORITHM = "sha256"
 DFT_SL_PCT = 2.0
 DFT_TP_PCT = 4.0
 DFT_LOGIN_LIMIT = 5
@@ -58,6 +59,9 @@ TESTNET = os.getenv("TESTNET", "false").lower() == "true"
 SL_OVERRIDE = os.getenv("SL_OVERRIDE", "true").lower() == "true"
 TP_OVERRIDE = os.getenv("TP_OVERRIDE", "true").lower() == "true"
 LOG_DEBUG = os.getenv("LOG_DEBUG", "false").lower() == "true"
+
+# --- STRINGS VARIABLES ---
+ALGORITHM = os.getenv("ALGO", "sha256").strip().lower()      # STRING
 
 # --- ENVIRONMENT VARIABLES ---
 SL_PCT = float(os.getenv("SL_PCT", "2"))                     # %
@@ -173,6 +177,7 @@ logging.Logger.date = date
 # --- BINANCE / TESTNET CONFIGURATION ---
 if TESTNET:
     # 🧪 TESTNET CONFIG
+    logger.info("🧪 Running in TESTNET mode")
     BINANCE_API_KEY = os.getenv("TESTNET_API_KEY")
     BINANCE_API_SECRET = os.getenv("TESTNET_API_SECRET")
     BASE_URL = "https://testnet.binance.vision"
@@ -180,12 +185,12 @@ if TESTNET:
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         logger.error("❌ Missing TESTNET API credentials")
         raise RuntimeError("Missing TESTNET API credentials")
-
-    logger.info("🧪 Running in TESTNET mode")
-    logger.info("🔐 Testnet API credentials loaded successfully")
+    else:
+        logger.info("🔐 Testnet API credentials loaded successfully")
 
 else:
     # 🌐 BINANCE CONFIG
+    logger.info("🌐 Running in LIVE mode")
     BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
     BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
     BASE_URL = "https://api.binance.com"
@@ -193,9 +198,8 @@ else:
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         logger.error("❌ Missing BINANCE API credentials")
         raise RuntimeError("Missing BINANCE API credentials")
-
-    logger.info("🌐 Running in LIVE mode")
-    logger.info("🔐 Binance API credentials loaded successfully")
+    else:
+        logger.info("🔐 Binance API credentials loaded successfully")
 
 
 # ====== SAFE DEPLOYMENT PATTERN ======
@@ -318,23 +322,39 @@ def _now_ms():
 # ====== SIGNING AND REQUESTING ======
 """HMAC-SHA256 request signing, retry logic with exponential backoff, and signed/unsigned request dispatchers."""
 
+# --- ALGORITHM VALIDATION ---
+def check_algorithm(ALGORITHM):
+    if ALGORITHM not in hashlib.algorithms_guaranteed:
+        logger.error(f" {ALGORITHM} not valid or unavailable or hashlib module")
+        raise ValueError(f"error: ALGORITHM '{ALGORITHM}' not valid.")
+    else:
+        return getattr(hashlib, ALGORITHM)
+
 # --- SIGNING ---
 def sign_params_query(params: dict, secret: str):
+    algo = check_algorithm(ALGORITHM)
     query = "&".join([f"{k}={v}" for k, v in params.items()])
-    signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    signature = hmac.new(secret.encode(), query.encode(), algo).hexdigest()
     return query, signature
+
+# --- STATUS CODES ---
+RETRYABLE_STATUS = {408, 409, 418, 423, 425, 429, 500, 502, 503, 504}
+FATAL_STATUS = {400, 401, 403, 404, 405, 412, 422}
+
+BACKOFFS = {
+    418: 60,
+    429: 5,
+    503: 5,
+    502: 3,
+    504: 3,
+}
 
 # --- REQUESTING ---
 def request_with_retries(method: str, url: str, **kwargs):
     for i in range(3):
         try:
             resp = requests.request(method, url, timeout=10, **kwargs)
-
-            # ⚠ ERROR 429
-            if resp.status_code == 429:
-                logger.error(f"🚫 429 RATE LIMIT hit (attempt {i+1}) → sleeping 3s")
-                time.sleep(3)
-                continue
+            status = resp.status_code
 
             try:
                 data = resp.json()
@@ -342,18 +362,47 @@ def request_with_retries(method: str, url: str, **kwargs):
                 data = resp.text
 
             # ⚠ ERROR CODES
-            if isinstance(data, dict) and "code" in data:
+            if status == 400 and isinstance(data, dict) and "code" in data:
                 if data["code"] < 0:
                     return data
 
+            # ⚠ ERROR LOGS
+            body_preview = resp.text[:300]
+            reason = resp.reason or ""
+            log_msg = (
+                f"⚠ Error {status} {reason} | {method} {url} | "
+                f"attempt={i+1} | params={kwargs.get('params')} | body={body_preview}")
+
+            if status >= 400:
+                logger.error(log_msg)
+
+            # ⚠ FATAL ERRORS
+            if status in FATAL_STATUS:
+                logger.error(f"🚫 Fatal | {log_msg}")
+                raise Exception(f"Non-retryable error {status}")
+
+            # ⚠ RETRAYABLE ERRORS
+            if status in RETRYABLE_STATUS:
+                retry_after = resp.headers.get("Retry-After")
+                sleep_time = int(retry_after) if retry_after else BACKOFFS.get(status, min(2 ** i, 10))
+                logger.error(f"🔁 Retryable → sleeping {sleep_time}s | {log_msg}")
+                time.sleep(sleep_time)
+                continue
+
             # ✅ 200 OK
-            if resp.status_code == 200:
+            if status == 200:
                 return data
 
             logger.error(f"⚠️ Attempt {i+1} failed: {data}")
 
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"⚠️ ConnectionError attempt {i+1}: {e}")
+        except requests.exceptions.Timeout as e:
+            logger.error(f"⚠️ Timeout attempt {i+1}: {e}")
+        except requests.exceptions.SSLError as e:
+            logger.error(f"⚠️ SSLError attempt {i+1}: {e}")
         except Exception as e:
-            logger.error(f"⚠️ Request error: {e}")
+            logger.error(f"⚠️ Unknown error attempt {i+1}: {type(e).__name__}: {e}")
 
         time.sleep(1)
 
@@ -364,8 +413,9 @@ def send_signed_request(http_method: str, path: str, payload: dict):
     if "timestamp" not in payload:
         payload["timestamp"] = _now_ms()
 
+    algo = check_algorithm(ALGORITHM)
     query_string = "&".join([f"{k}={v}" for k, v in payload.items()])
-    signature = hmac.new(BINANCE_API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+    signature = hmac.new(BINANCE_API_SECRET.encode(), query_string.encode(), algo).hexdigest()
     url = f"{BASE_URL}{path}?{query_string}&signature={signature}"
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
     return request_with_retries(http_method, url, headers=headers)
@@ -675,6 +725,8 @@ def cleanup(symbol: str):
 
                 if buy_cost > free_usdc:
                     logger.info(f"ℹ️ Not enough USDC for cleanup buy (need {buy_cost:.4f}, have {free_usdc:.4f}) — skipping buy")
+                elif buy_cost < lot["minNotional"]:
+                    logger.info(f"ℹ️ Cleanup buy below minNotional ({buy_cost:.4f} < {lot['minNotional']}) — skipping buy")
                 else:
                     # 🛒 TOP UP BUY PARAMS
                     params = {
@@ -959,7 +1011,29 @@ def post_trade(symbol, side, resp, lot, webhook_data, trade_id):
             trade_id=trade_id
             )
 
+        update_last_trade(symbol, side, executed_qty, spent_qty)
+
     return executed_qty, entry
+
+# ====== LAST TRADE PAYLOAD ======
+"""Showcases a payload with the data of the las succesfully executed in the account."""
+
+# --- LAST TRADE PLACEHOLDER ---
+LAST_TRADE = {}
+
+# --- LAST TARDE FUNCTION ---
+def update_last_trade(symbol: str, side: str, executed_qty: str, spent_qty: str):
+    global LAST_TRADE
+
+    # ⌚ LAST TRADE PAYLOAD
+    LAST_TRADE = {
+        "symbol": symbol,
+        "side": side,
+        "executed_qty": executed_qty,
+        "spent_qty": spent_qty,
+        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    }
+
 
 # ====== SL/TP FUNCTIONS ======
 """Places OCO, stop-loss-only, or take-profit-only orders after trade execution, with tick-aligned prices and commission-adjusted quantities."""
@@ -968,7 +1042,7 @@ def post_trade(symbol, side, resp, lot, webhook_data, trade_id):
 def place_sl_tp_margin(symbol: str, side: str, entry: float, executed_qty: float, lot: dict, sl_override=None, tp_override=None, trade_id=None):
     try:
         COMMISSION_BUFFER = Decimal("1") - (COMMISSION / Decimal("100"))
-        oco_side = "SELL" if side == "BUY" else "BUY"
+        oco_side = "SELL" if side == "Long" else "BUY"
 
         # --- Determine if SL/TP should be used ---
         use_sl = sl_override is not None or (SL_OVERRIDE and SL_PCT is not None)
@@ -1020,9 +1094,9 @@ def place_sl_tp_margin(symbol: str, side: str, entry: float, executed_qty: float
             sl_price_str = f"{sl_price_aligned:.{decimals}f}"
 
             if side == "BUY":
-                stop_limit_aligned = align_price(sl_price_aligned * 0.999, lot["tickSize_str"], ROUND_DOWN)
+                stop_limit_aligned = align_price(sl_price_aligned * 1.001, lot["tickSize_str"], ROUND_DOWN)
             else:
-                stop_limit_aligned = align_price(sl_price_aligned * 1.001, lot["tickSize_str"], ROUND_UP)
+                stop_limit_aligned = align_price(sl_price_aligned * 0.999, lot["tickSize_str"], ROUND_UP)
 
             stop_limit_price = f"{stop_limit_aligned:.{decimals}f}"
 
@@ -1252,6 +1326,9 @@ def build_snapshot():
             "tp_override": TP_OVERRIDE,
             "log_debug": LOG_DEBUG,
 
+            # 🔤 STRING VARS
+            "algorithm": ALGORITHM,
+
             # 🔢 ENV VARS
             "sl_pct": SL_PCT,
             "tp_pct": TP_PCT,
@@ -1275,15 +1352,18 @@ def snapshot_worker():
                 word = "days"
             snapshot = build_snapshot()
             store_snapshot(snapshot)
-            logger.info("📸 Snapshot stored")
 
             if LOG_DEBUG:
                 logger.admin(f"📋 Snapshot stored: {snapshot}")
+            else:
+                logger.info("📸 Snapshot stored")
+
+            logger.info(f"⏰ Next snapshot in {SNAPSHOT_INTERVAL} {word}")
+            time.sleep(SNAPSHOT_INTERVAL * 86400)
 
         except Exception as e:
             logger.error(f"⚠️ Snapshot error: {e}")
-        finally:
-            logger.info(f"⏲ Next snapshot in {SNAPSHOT_INTERVAL} {word}")
+            logger.info(f"⏰ Next snapshot attempt in {SNAPSHOT_INTERVAL} {word}")
             time.sleep(SNAPSHOT_INTERVAL * 86400)
 
 # --- SNAPSHOT EXECUTION ---
@@ -1342,14 +1422,23 @@ def sanitize_payload(payload: dict) -> dict:
 SYMBOL_INFO_MAP = {}
 EXCHANGE_INFO = {}
 
-# --- LOAD EXCANGE INFO ---
-def load_exchange_info():
-    global EXCHANGE_INFO
-
-    logger.info("📡 Loading exchange info...")
-    EXCHANGE_INFO = send_public_request("GET", "/api/v3/exchangeInfo")
-    SYMBOL_INFO_MAP = {s["symbol"]: s for s in EXCHANGE_INFO.get("symbols", [])}
-    logger.info(f"ℹ Exchange info loaded ({len(SYMBOL_INFO_MAP)} symbols available)")
+# --- EXCHANGE INFO LOADING ---
+def load_exchange_info(max_attempts=5, delay=5):
+    global EXCHANGE_INFO, SYMBOL_INFO_MAP
+    for attempt in range(1, max_attempts + 1):
+        try:
+            logger.info(f"📡 Loading exchange info (attempt {attempt}/{max_attempts})...")
+            EXCHANGE_INFO = send_public_request("GET", "/api/v3/exchangeInfo")
+            SYMBOL_INFO_MAP = {s["symbol"]: s for s in EXCHANGE_INFO.get("symbols", [])}
+            logger.info(f"✅ Exchange info loaded ({len(SYMBOL_INFO_MAP)} symbols available)")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Exchange info attempt {attempt} failed: {e}")
+            if attempt < max_attempts:
+                logger.info(f"⏳ Retrying in {delay}s...")
+                time.sleep(delay)
+    logger.error("❌ Could not load exchange info after all attempts — bot will retry on first trade")
+    return False
 
 # --- EXCHANGE INFO LOADING ---
 try:
@@ -1439,7 +1528,7 @@ def borrow(amount: float):
 
     # 📥 LEVERAGE BORROW RESP
     resp = send_signed_request("POST", "/sapi/v1/margin/loan", params)
-    err = check_error(resp, "USDC", "Leverage Borrow")
+    err = check_error(resp, asset, "Leverage Borrow")
     if err:
         return err
 
@@ -1480,7 +1569,7 @@ def repay(amount):
 
     # 💳 LEVERAGE REPAY RESP
     resp = send_signed_request("POST", "/sapi/v1/margin/repay", params)
-    err = check_error(resp, "USDC", "Leverage Repay")
+    err = check_error(resp, asset, "Leverage Repay")
     if err:
         return err
 
@@ -1493,45 +1582,57 @@ def set_var(var_name, value):
         vn = var_name.strip().lower()
 
         if vn not in SETTABLE_VARS:
-            return {"error": f"unknown variable: {var_name}"}
+            return {"status": "error", "msg": f"unknown variable: {var_name}"}
 
         meta = SETTABLE_VARS[vn]
         current_value = globals().get(meta["var"])
 
         # 🎚 BOOL HANDLING
         if meta["type"] == "bool":
-            if str(value).lower() in ("on", "true", "1"):
+            val = str(value).strip().lower()
+
+            if val in ("on", "true", "1"):
                 parsed = True
-            elif str(value).lower() in ("off", "false", "0"):
+            elif val in ("off", "false", "0"):
                 parsed = False
             else:
                 return {"status": "error", "msg": f"invalid bool value for {var_name}"}
 
             emoji = meta["emoji_on"] if parsed else meta["emoji_off"]
 
-            if current_value == parsed:
-                logger.admin(f"{emoji} {meta['var']} already in {parsed}\n")
-                return {"status": "ok", "var": vn, "value": parsed, "no_change": True}
+        # 🔤 STRING HANDLING
+        elif meta["type"] == str:
+            parsed = str(value).strip().lower()
 
-            globals()[meta["var"]] = parsed
-            logger.admin(f"{emoji} ADMIN ACTION: {meta['var']} → {parsed}\n")
-            return {"status": "ok", "var": vn, "value": parsed}
+            if "allowed" in meta and parsed not in meta["allowed"]:
+                return {
+                    "status": "error",
+                    "msg": f"invalid value for {var_name}. allowed: {meta['allowed']}"
+                }
+
+            emoji = meta.get("var_emoji", "🧠")
 
         # 🔢 NUMERIC HANDLING
-        try:
-            parsed = meta["type"](value)
-        except Exception:
-            return {"status": "error", "msg": f"invalid value for {var_name}"}
+        else:
+            try:
+                parsed = meta["type"](value)
+            except Exception:
+                return {"status": "error", "msg": f"invalid value for {var_name}"}
 
-        parsed = max(meta["min"], min(parsed, meta["max"]))
-        emoji = meta.get("var_emoji", "⚙️")
+            # Clamp solo si existen límites
+            if "min" in meta and "max" in meta:
+                parsed = max(meta["min"], min(parsed, meta["max"]))
 
+            emoji = meta.get("var_emoji", "⚙️")
+
+        # 🔁 APPLY CHANGE
         if current_value == parsed:
             logger.admin(f"{emoji} {meta['var']} already {parsed}\n")
             return {"status": "ok", "var": vn, "value": parsed, "no_change": True}
 
         globals()[meta["var"]] = parsed
         logger.admin(f"{emoji} ADMIN ACTION: {meta['var']} → {parsed}\n")
+
         return {"status": "ok", "var": vn, "value": parsed}
 
     except Exception as e:
@@ -1540,7 +1641,7 @@ def set_var(var_name, value):
 
 # --- ADMIN RESTORE ---
 def restore():
-    global TRADING, TESTNET, SL_OVERRIDE, TP_OVERRIDE, LOG_DEBUG, SL_PCT, TP_PCT, LOGIN_LIMIT, LOGIN_RETRY, SESSION_TIME
+    global TRADING, TESTNET, SL_OVERRIDE, TP_OVERRIDE, LOG_DEBUG, ALGORITHM, SL_PCT, TP_PCT, LOGIN_LIMIT, LOGIN_RETRY, SESSION_TIME
 
     logger.admin("💣 ADMIN ACTION: RESTORE default trading parameters")
     TRADING = DFT_TRADING
@@ -1548,6 +1649,7 @@ def restore():
     SL_OVERRIDE = DFT_SL_OVERRIDE
     TP_OVERRIDE = DFT_TP_OVERRIDE
     LOG_DEBUG = DFT_LOG_DEBUG
+    ALGORITHM = DFT_ALGORITHM
     SL_PCT = DFT_SL_PCT
     TP_PCT = DFT_TP_PCT
     LOGIN_LIMIT = DFT_LOGIN_LIMIT
@@ -1558,6 +1660,7 @@ def restore():
     logger.admin(f"🔄 SL_OVERRIDE restored → {SL_OVERRIDE}")
     logger.admin(f"🔄 TP_OVERRIDE restored → {TP_OVERRIDE}")
     logger.admin(f"🔄 LOG_DEBUG restored → {LOG_DEBUG}")
+    logger.admin(f"🔄 ALGORITHM restored → {ALGORITHM}")
     logger.admin(f"🔄 SL_PCT restored → {SL_PCT}")
     logger.admin(f"🔄 TP_PCT restored → {TP_PCT}")
     logger.admin(f"🔄 LOGIN_LIMIT restored → {LOGIN_LIMIT}")
@@ -1570,6 +1673,7 @@ def restore():
         "SL_OVERRIDE": SL_OVERRIDE,
         "TP_OVERRIDE": TP_OVERRIDE,
         "LOG_DEBUG": LOG_DEBUG,
+        "ALGORITHM": ALGORITHM,
         "status": "ok",
         "SL_PCT": SL_PCT,
         "TP_PCT": TP_PCT,
@@ -1578,18 +1682,6 @@ def restore():
         "SESSION_TIME": SESSION_TIME,
     }
 
-# ====== ADMIN PAYLOADS ======
-"""Registry mapping admin action names to their handler functions and variables subjet to post-deploy setting."""
-
-# --- ADMIN ACTIONS ---
-ADMIN_ACTIONS = {
-    "CLEAR": clear,
-    "BORROW": borrow,
-    "REPAY": repay,
-    "SET": set_var,
-    "RESTORE": restore,
-}
-
 # --- SETTABLE VARS ---
 SETTABLE_VARS = {
     "trading":      {"type": "bool", "var": "TRADING",      "emoji_on": "▶", "emoji_off": "⏸"},
@@ -1597,6 +1689,7 @@ SETTABLE_VARS = {
     "sl_override":  {"type": "bool", "var": "SL_OVERRIDE",  "emoji_on": "🟢", "emoji_off": "🔴"},
     "tp_override":  {"type": "bool", "var": "TP_OVERRIDE",  "emoji_on": "🟢", "emoji_off": "🔴"},
     "log_debug":    {"type": "bool", "var": "LOG_DEBUG",    "emoji_on": "📋", "emoji_off": "🔎"},
+    "algorithm":    {"type": str,    "var": "ALGORITHM",    "var_emoji": "🧠", "allowed": list(hashlib.algorithms_guaranteed)},
     "sl_pct":       {"type": float,  "var": "SL_PCT",       "var_emoji": "🔴", "min": MIN_SL_PCT,       "max": MAX_SL_PCT},
     "tp_pct":       {"type": float,  "var": "TP_PCT",       "var_emoji": "🟢", "min": MIN_TP_PCT,       "max": MAX_TP_PCT},
     "login_limit":  {"type": int,    "var": "LOGIN_LIMIT",  "var_emoji": "🛠", "min": MIN_LOGIN_LIMIT,  "max": MAX_LOGIN_LIMIT},
@@ -1610,44 +1703,44 @@ SETTABLE_VARS = {
 
 # --- ADMIN PLACEHOLDERS ---
 ADMIN_SESSIONS = {}
+ADMIN_SESSIONS_LOCK = threading.Lock()
 LOGIN_ATTEMPTS = {}
 
 # --- ADMIN IP IDENTIFICATION ---
 def get_ip():
-    if request.headers.get("X-Forwarded-For"):
-        return request.headers.get("X-Forwarded-For").split(",")[0].strip()
-
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        ip = forwarded.split(",")[0].strip()
+        return ip
     return request.remote_addr
 
 # --- ADMIN SESSION OPENING ---
 def create_admin_session(ip):
-    ADMIN_SESSIONS[ip] = time.time()
+    with ADMIN_SESSIONS_LOCK:
+        ADMIN_SESSIONS[ip] = time.time()
+        if ip in LOGIN_ATTEMPTS:
+            del LOGIN_ATTEMPTS[ip]
     logger.admin(f"🔓 Admin session opened for {ip}\n")
-
-    if ip in LOGIN_ATTEMPTS:
-        del LOGIN_ATTEMPTS[ip]
 
 # --- ADMIN SESSION CLOSING ---
 def destroy_admin_session(ip):
-    if ip in ADMIN_SESSIONS:
-        del ADMIN_SESSIONS[ip]
-        logger.admin(f"🔐 Admin session closed for {ip}\n")
+    with ADMIN_SESSIONS_LOCK:
+        if ip in ADMIN_SESSIONS:
+            del ADMIN_SESSIONS[ip]
+            logger.admin(f"🔐 Admin session closed for {ip}\n")
 
 # --- ADMIN SESSION EXPIRING ---
 def is_admin_authenticated():
     ip = get_ip()
-
-    if ip not in ADMIN_SESSIONS:
-        return False
-
-    last_activity = ADMIN_SESSIONS[ip]
-
-    if time.time() - last_activity > (SESSION_TIME * 60):
-        logger.admin(f"🔒 Admin session expired for {ip}\n")
-        del ADMIN_SESSIONS[ip]
-        return False
-
-    ADMIN_SESSIONS[ip] = time.time()
+    with ADMIN_SESSIONS_LOCK:
+        if ip not in ADMIN_SESSIONS:
+            return False
+        last_activity = ADMIN_SESSIONS[ip]
+        if time.time() - last_activity > (SESSION_TIME * 60):
+            logger.admin(f"🔒 Admin session expired for {ip}\n")
+            del ADMIN_SESSIONS[ip]
+            return False
+        ADMIN_SESSIONS[ip] = time.time()
     return True
 
 # --- RETURNS WHEN UNAUTHORIZED ---
@@ -1860,10 +1953,14 @@ def admin_snapshot():
     if not is_admin_authenticated():
         return handle_unauthorized()
 
-    snapshot = build_snapshot()
-    milestones = check_milestones(snapshot["totalBalanceUSDC"])
-    snapshot["milestonesReached"] = milestones
-    return jsonify(snapshot), 200
+    try:
+        snapshot = build_snapshot()
+        milestones = check_milestones(snapshot["totalBalanceUSDC"])
+        snapshot["milestonesReached"] = milestones
+        return jsonify(snapshot), 200
+    except Exception as e:
+        logger.error(f"⚠️ Snapshot endpoint error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.template_filter('log_class')
@@ -1886,6 +1983,8 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="description" content="SGNT — Automated margin trading system for Binance Cross Margin.">
         <title>SGNT</title>
         <link rel="icon" type="image/png" href="/static/sgnticon.png">
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
@@ -1903,19 +2002,33 @@ def index():
             body.light .adam-pre{color:#1f2937}
             .adam-center{display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;min-width:200px;padding:0 16px}
             .logo{width:140px;margin-bottom:20px;opacity:0.95}
-            .tagline{font-size:10px;letter-spacing:0.12em;color:#475569;text-transform:uppercase;margin-bottom:24px;font-family:'Courier New',monospace;text-align:center}
+            .tagline{font-size:12px;letter-spacing:0.12em;color:#475569;text-transform:uppercase;margin-bottom:24px;font-family:'Courier New',monospace;text-align:center}
             .cards{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;width:100%;margin-bottom:24px}
             .card{background:#1e293b;border:0.5px solid #334155;border-radius:8px;padding:12px;text-align:center}
             body.light .card{background:#ffffff;border-color:#e2e8f0}
-            .card-val{font-size:11px;font-family:'Courier New',monospace;color:#94a3b8;margin-bottom:4px}
+            .card-val{font-size:12px;font-family:'Courier New',monospace;color:#94a3b8;margin-bottom:4px}
             body.light .card-val{color:#475569}
-            .card-label{font-size:9px;letter-spacing:0.06em;color:#475569;text-transform:uppercase}
+            .card-label{font-size:12px;letter-spacing:0.06em;color:#475569;text-transform:uppercase}
             .btn-login{padding:8px 28px;font-size:11px;letter-spacing:0.06em;border:0.5px solid #334155;border-radius:6px;background:transparent;color:#94a3b8;cursor:pointer;text-decoration:none;transition:0.15s;font-family:'Inter',sans-serif;text-transform:uppercase}
             body.light .btn-login{border-color:#cbd5e1;color:#64748b}
             .btn-login:hover{background:#1e293b;color:#f1f5f9;border-color:#64748b}
             body.light .btn-login:hover{background:#e2e8f0;color:#0f172a}
-            .footer{position:fixed;bottom:20px;font-size:10px;color:#1e293b;letter-spacing:0.08em;font-family:'Courier New',monospace}
+            .footer{position:fixed;bottom:20px;font-size:12px;color:#1e293b;letter-spacing:0.08em;font-family:'Courier New',monospace}
             body.light .footer{color:#94a3b8}
+            @media (max-width: 600px) {
+                .db { grid-template-columns: 1fr !important; }
+                .col-2 { grid-column: span 1 !important; }
+                .adam-pre { display: none; }
+                .cards { grid-template-columns: 1fr 1fr 1fr; }
+                .metric-big { font-size: 18px; }
+                .btn { min-height: 36px; padding: 8px 12px; }
+                .btn-minmax { min-height: 32px; padding: 6px 8px; }
+                .input-row input[type=number], .input-row input[type=text] { min-height: 36px; }
+                .toggle { width: 40px; height: 22px; }
+                .slider:before { width: 16px; height: 16px; }
+                input:checked+.slider:before { transform: translateX(18px); }
+            }
+
         </style>
     </head>
     <body>
@@ -2069,6 +2182,8 @@ def login():
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="description" content="SGNT — Automated margin trading system for Binance Cross Margin.">
         <title>SGNT Login</title>
         <link rel="icon" type="image/png" href="/static/sgnticon.png">
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
@@ -2162,6 +2277,8 @@ def dashboard():
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="description" content="SGNT — Automated margin trading system for Binance Cross Margin.">
         <title>SGNT Dashboard</title>
         <link rel="icon" type="image/png" href="/static/sgnticon.png">
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
@@ -2175,9 +2292,9 @@ def dashboard():
             .topbar-right{display:flex;align-items:center;gap:8px}
             .dot{width:8px;height:8px;border-radius:50%;background:#1D9E75;display:inline-block}
             .dot.red{background:#E24B4A}
-            .status-text{font-size:11px;color:#94a3b8;font-family:'Courier New',monospace}
+            .status-text{font-size:12px;color:#94a3b8;font-family:'Courier New',monospace}
             body.light .status-text{color:#64748b}
-            .tag{font-size:10px;padding:2px 8px;border-radius:6px;border:0.5px solid;font-family:'Courier New',monospace}
+            .tag{font-size:12px;padding:2px 8px;border-radius:6px;border:0.5px solid;font-family:'Courier New',monospace}
             .tag-live{border-color:#1D9E75;color:#1D9E75}
             .tag-testnet{border-color:#BA7517;color:#BA7517}
             .theme-toggle{background:none;border:0.5px solid #334155;border-radius:20px;padding:4px 10px;cursor:pointer;font-size:13px;color:#94a3b8;transition:0.15s;display:flex;align-items:center;gap:6px}
@@ -2187,7 +2304,7 @@ def dashboard():
             .db{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;padding:12px 0}
             .card{background:#1e293b;border:0.5px solid #334155;border-radius:8px;padding:14px 16px}
             body.light .card{background:#ffffff;border-color:#e2e8f0}
-            .card-title{font-size:10px;letter-spacing:0.08em;color:#64748b;text-transform:uppercase;margin-bottom:10px;border-bottom:0.5px solid #334155;padding-bottom:6px}
+            .card-title{font-size:12px;letter-spacing:0.08em;color:#64748b;text-transform:uppercase;margin-bottom:10px;border-bottom:0.5px solid #334155;padding-bottom:6px}
             body.light .card-title{border-bottom-color:#e2e8f0}
             .metric-big{font-size:22px;font-weight:500;color:#f1f5f9;font-family:'Courier New',monospace}
             body.light .metric-big{color:#0f172a}
@@ -2227,8 +2344,8 @@ def dashboard():
             body.light .btn-minmax:hover{background:#e2e8f0}
             .col-full{grid-column:1/-1}
             .col-2{grid-column:span 2}
-            .section-label{font-size:10px;letter-spacing:0.08em;color:#475569;text-transform:uppercase;margin:10px 0 4px;grid-column:1/-1;padding-left:2px}
-            .asset-row{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;color:#94a3b8}
+            .section-label{font-size:12px;letter-spacing:0.08em;color:#475569;text-transform:uppercase;margin:10px 0 4px;grid-column:1/-1;padding-left:2px}
+            .asset-row{display:flex;justify-content:space-between;font-size:12px;padding:2px 0;color:#94a3b8}
             .margin-bar-bg{height:4px;background:#334155;border-radius:4px;margin-top:4px;overflow:hidden}
             .margin-bar-fill{height:100%;border-radius:4px;background:#1D9E75;transition:width 0.4s}
             .toast{position:fixed;bottom:16px;right:16px;background:#1e293b;border:0.5px solid #334155;border-radius:8px;padding:8px 14px;font-size:12px;color:#f1f5f9;opacity:0;transition:opacity 0.3s;z-index:100;font-family:'Courier New',monospace}
@@ -2294,9 +2411,17 @@ def dashboard():
             <div class="metric-row"><span class="k">Total</span><span class="v" id="total-debt">—</span></div>
             <div class="metric-row"><span class="k">Borrowed USDC</span><span class="v" id="usdc-borrowed">—</span></div>
         </div>
-        <div class="card col-2">
+        <div class="card">
             <div class="card-title">Assets with balance</div>
             <div id="assets-list"><span style="font-size:12px;color:#475569">—</span></div>
+        </div>
+        <div class="card">
+            <div class="card-title">Last Trade</div>
+            <div class="metric-row"><span class="k">Symbol</span><span class="v" id="lt-symbol">—</span></div>
+            <div class="metric-row"><span class="k">Side</span><span class="v" id="lt-side">—</span></div>
+            <div class="metric-row"><span class="k">Qty</span><span class="v" id="lt-qty">—</span></div>
+            <div class="metric-row"><span class="k">Spent</span><span class="v" id="lt-spent">—</span></div>
+            <div class="metric-row"><span class="k">Time</span><span class="v" id="lt-time" style="font-size:10px">—</span></div>
         </div>
 
         <div class="section-label">Trading</div>
@@ -2385,6 +2510,15 @@ def dashboard():
 
         <div class="card" style="display:flex;flex-direction:column;justify-content:space-between">
             <div class="card-title">System</div>
+            <div style="font-size:11px;color:#64748b;margin-bottom:4px">
+                Algorithm <span id="algo-val" style="color:#f1f5f9">—</span>
+            </div>
+            <div class="input-row" style="margin-bottom:8px">
+                <select id="algo-select" style="flex:1;padding:5px 8px;font-size:12px;background:#0f172a;border:0.5px solid #334155;border-radius:6px;color:#f1f5f9;font-family:'Courier New',monospace">
+                    {{ algo_options | safe }}
+                </select>
+                <button class="btn" onclick="setVar('algorithm', document.getElementById('algo-select').value)">Set</button>
+            </div>
             <div class="toggle-row"><span class="toggle-label">Log Debug</span><label class="toggle"><input type="checkbox" id="tog-debug" onchange="setVar('log_debug',this.checked)"><span class="slider"></span></label></div>
             <div style="margin-top:10px"><a href="/logs"><button class="btn" style="width:100%">See logs</button></a></div>
             <div style="margin-top:10px"><a href="/metrics"><button class="btn" style="width:100%">See metrics</button></a></div>
@@ -2503,6 +2637,20 @@ def dashboard():
             if (milestones.length > 0) {
                 showMilestone(milestones[milestones.length - 1]);
             }
+
+            const lt = d.lastTrade || {};
+            document.getElementById('lt-symbol').textContent = lt.symbol || '—';
+            document.getElementById('lt-side').textContent = lt.side || '—';
+            document.getElementById('lt-side').style.color = lt.side === 'Long' ? '#4ade80' : lt.side === 'Short' ? '#f87171' : '#f1f5f9';
+            document.getElementById('lt-qty').textContent = lt.executed_qty != null ? parseFloat(lt.executed_qty).toFixed(5) : '—';
+            document.getElementById('lt-spent').textContent = lt.spent_qty != null ? parseFloat(lt.spent_qty).toFixed(2) + ' $' : '—';
+            document.getElementById('lt-time').textContent = lt.time || '—';
+
+            if (v.algorithm) {
+                document.getElementById('algo-val').textContent = v.algorithm;
+                document.getElementById('algo-select').value = v.algorithm;
+            }
+
         }
 
         async function setVar(varName, val) {
@@ -2586,6 +2734,10 @@ def dashboard():
     MAX_LOGIN_RETRY=MAX_LOGIN_RETRY,
     MIN_SESSION_TIME=MIN_SESSION_TIME,
     MAX_SESSION_TIME=MAX_SESSION_TIME,
+    algo_options="\n".join(
+        f'<option value="{a}">{a}</option>'
+        for a in sorted(hashlib.algorithms_guaranteed)
+    ),
 )
 
 
@@ -2659,6 +2811,8 @@ def logs():
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="description" content="SGNT — Automated margin trading system for Binance Cross Margin.">
         <title>SGNT Logs</title>
         <link rel="icon" type="image/png" href="/static/sgnticon.png">
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
@@ -2841,6 +2995,8 @@ def metrics():
         <!DOCTYPE html>
         <html>
         <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <meta name="description" content="SGNT — Automated margin trading system for Binance Cross Margin.">
             <title>SGNT Metrics</title>
             <link rel="icon" type="image/png" href="/static/sgnticon.png">
             <style>
@@ -2861,6 +3017,8 @@ def metrics():
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="description" content="SGNT — Automated margin trading system for Binance Cross Margin.">
         <title>SGNT Metrics</title>
         <link rel="icon" type="image/png" href="/static/sgnticon.png">
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
