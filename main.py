@@ -2763,22 +2763,25 @@ def logs():
     if filename:
         if not filename.endswith(".log"):
             return {"error": "invalid file type"}, 400
+
         if not os.path.isfile(filename):
             return {"error": "file not found"}, 404
+
+        display_name = filename
+
+        if filename == "sgnt.log":
+            date_str = datetime.utcnow().strftime("%Y-%m-%d")
+            display_name = f"sgnt.{date_str}.log"
+
         if level:
             with open(filename, "r", encoding="utf-8") as f:
                 filtered_lines = [line for line in f if level in line]
-            download_name = f"{display_name}({level}).log" if filename == "sgnt.log" else f"{filename}({level}).log"
+            download_name = f"{display_name}({level}).log"
             return Response(
                 "".join(filtered_lines),
                 mimetype="text/plain",
                 headers={"Content-Disposition": f"attachment; filename={download_name}"}
             )
-
-        display_name = filename
-        if filename == "sgnt.log":
-            date_str = datetime.utcnow().strftime("%Y-%m-%d")
-            display_name = f"sgnt.{date_str}.log"
 
         return send_file(filename, as_attachment=True, download_name=display_name, mimetype="text/plain")
 
