@@ -362,9 +362,8 @@ def request_with_retries(method: str, url: str, **kwargs):
                 data = resp.text
 
             # ⚠ ERROR CODES
-            if status == 400 and isinstance(data, dict) and "code" in data:
-                if data["code"] < 0:
-                    return data
+            if status == 400 and isinstance(data, dict) and "code" in data and data["code"] < 0:
+                return data
 
             # ⚠ ERROR LOGS
             body_preview = resp.text[:300]
@@ -1788,14 +1787,20 @@ def webhook():
     # ❓ RETURN FOR MISSING DATA
     if "symbol" not in data or "side" not in data:
         logger.info(f"📩 JSON received: {sanitize_payload(data)}")
-        logger.error("❓ Missing trading fields")
+        if "symbol" not in data:
+            logger.error("❓ Missing trading fields: symbol")
+        if "side" not in data:
+            logger.error("❓ Missing trading fields: side")
         return jsonify({"error": "Missing trading fields\n"}), 400
 
     # 🚫 RETURN FOR INCORRECT KEY
     if TRADING_KEY:
         if data.get("key") != TRADING_KEY:
             logger.info(f"📩 JSON received: {sanitize_payload(data)}")
-            logger.error("🚫 Invalid or missing trading_key\n")
+            if data.get("key") == "":
+                logger.error("🚫 Missing trading_key\n")
+            else:
+                logger.error("🚫 Invalid trading_key\n")
             return jsonify({"status": "blocked", "reason": "invalid trading key"}), 403
 
     # ✅ TRADE PROCESSING
